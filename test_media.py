@@ -30,13 +30,34 @@ def test_media_route_transcript_gets_1h_ttl():
     assert mock.call_args[0][1] == app.FILE_PRESIGN_TTL
 
 
-def test_presign_tigris_uses_boto3(monkeypatch):
-    import boto3
+def test_tigris_backend_presign_uses_boto3():
+    import storage
 
-    monkeypatch.setattr(app, "TIGRIS_ENDPOINT", "https://fly.storage.tigris.dev")
-    monkeypatch.setattr(app, "TIGRIS_BUCKET", "kb")
-    with patch.object(boto3, "client") as mock_client:
-        mock_client.return_value.generate_presigned_url.return_value = "https://signed"
-        url = app.presign("videos/foo.mp4", app.VIDEO_PRESIGN_TTL)
+    backend = storage.TigrisBackend("https://fly.storage.tigris.dev", "ak", "sk", "kb")
+    with patch.object(backend._client, "generate_presigned_url", return_value="https://signed") as mock:
+        url = backend.presign("videos/foo.mp4", app.VIDEO_PRESIGN_TTL)
     assert url == "https://signed"
-    mock_client.assert_called_once()
+    mock.assert_called_once()
+
+
+def test_make_storage_selects_tigris_when_endpoint_set():
+    import storage
+
+    s = storage.make_storage(
+        list_host="lh", public_host="ph", access="a", secret="s",
+        region="r", bucket="b", endpoint="https://fly.storage.tigris.dev",
+        tigris_access="ak", tigris_secret="sk", tigris_bucket="kb",
+    )
+    assert isinstance(s, storage.TigrisBackend)
+    assert s.bucket == "kb"
+
+
+def test_make_storage_defaults_to_minio():
+    import storage
+
+    s = storage.make_storage(
+        list_host="lh", public_host="ph", access="a", secret="s",
+        region="r", bucket="b",
+    )
+    assert isinstance(s, storage.MinioBackend)
+    assert s.bucket == "b"

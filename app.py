@@ -15,7 +15,9 @@ from datetime import timedelta
 
 import yaml
 import markdown
-from minio import Minio
+from types import SimpleNamespace
+
+import storage
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response, FileResponse, StreamingResponse
 
@@ -42,6 +44,20 @@ FILE_PRESIGN_TTL = timedelta(hours=1)     # transcripts/slides are single fetche
 
 VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov")
 MEDIA_PREFIXES = ("reels/", "videos/", "threads/")  # reels first = preferred on slug conflict (full-quality originals)
+
+# Single storage backend — Tigris when AWS_ENDPOINT_URL_S3 is set, else MinIO.
+store = storage.make_storage(
+    list_host=MINIO_LIST_HOST,
+    public_host=MINIO_PUBLIC_HOST,
+    access=MINIO_ACCESS,
+    secret=MINIO_SECRET,
+    region=REGION,
+    bucket=BUCKET,
+    endpoint=TIGRIS_ENDPOINT,
+    tigris_access=TIGRIS_ACCESS,
+    tigris_secret=TIGRIS_SECRET,
+    tigris_bucket=TIGRIS_BUCKET,
+)
 TAG_FILTER = os.environ.get("TAG_FILTER", "").strip()  # when set, only notes with this tag (+ their videos) are served
 SUMMIT_PROGRAM = [  # program order for the Sommet TDAH 2026 edition (used when TAG_FILTER set)
     "tdah-adulte-2026-j1-jonathan-moussa",
@@ -203,18 +219,16 @@ def _folder_rank(name: str) -> int:
 
 
 def _videos_by_slug():
-    """{slug: MinIO object} — deduped, reels preferred over videos/ on conflict."""
-    client = Minio(MINIO_LIST_HOST, MINIO_ACCESS, MINIO_SECRET, secure=False, region=REGION)
+    """{slug: video object} — deduped, reels preferred over videos/ on conflict."""
     by_slug = {}
     for prefix in MEDIA_PREFIXES:
-        for o in client.list_objects(BUCKET, prefix=prefix, recursive=True):
-            name = o.object_name
+        for name, size in store.list_objects(prefix):
             if not name.lower().endswith(VIDEO_EXTS):
                 continue
             slug = os.path.splitext(name.rsplit("/", 1)[-1])[0]
             cur = by_slug.get(slug)
             if cur is None or _folder_rank(name) < _folder_rank(cur.object_name):
-                by_slug[slug] = o
+                by_slug[slug] = SimpleNamespace(object_name=name, size=size)
     return by_slug
 
 
@@ -255,33 +269,8 @@ def catalog():
 
 
 def presign(key: str, ttl: timedelta | None = None) -> str:
-    """Presign a GET URL for an object key.
-
-    Uses Tigris (boto3, S3-compatible) when AWS_ENDPOINT_URL_S3 is set;
-    otherwise falls back to the MinIO SDK. TTL defaults to PRESIGN_TTL.
-    """
-    ttl = ttl or PRESIGN_TTL
-    if TIGRIS_ENDPOINT:
-        import boto3
-        from botocore.config import Config
-
-        client = boto3.client(
-            "s3",
-            region_name="auto",
-            endpoint_url=TIGRIS_ENDPOINT,
-            aws_access_key_id=TIGRIS_ACCESS,
-            aws_secret_access_key=TIGRIS_SECRET,
-            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
-        )
-        return client.generate_presigned_url(
-            "get_object",
-            Params={"Bucket": TIGRIS_BUCKET, "Key": key},
-            ExpiresIn=int(ttl.total_seconds()),
-        )
-    # region set explicitly so the SDK skips the GetBucketLocation network
-    # call (which would hit media.sevend.io through the Access gate → 403).
-    client = Minio(MINIO_PUBLIC_HOST, MINIO_ACCESS, MINIO_SECRET, secure=True, region=REGION)
-    return client.presigned_get_object(BUCKET, key, expires=ttl)
+    """Presign a GET URL for an object key via the active storage backend."""
+    return store.presign(key, ttl or PRESIGN_TTL)
 
 
 def _object_key_from_url(url: str):
@@ -373,28 +362,15 @@ def api_download(slug: str):
     if slug not in vids:
         raise HTTPException(status_code=404, detail="video not found")
     key = vids[slug].object_name
-    client = Minio(MINIO_LIST_HOST, MINIO_ACCESS, MINIO_SECRET, secure=False, region=REGION)
     try:
-        total = client.stat_object(BUCKET, key).size
-        resp = client.get_object(BUCKET, key)
+        total = store.stat(key)
     except Exception:
         raise HTTPException(status_code=404, detail="video not found")
-
-    def _iter():
-        try:
-            for chunk in resp.stream(amt=1024 * 1024):
-                yield chunk
-        finally:
-            try:
-                resp.close()
-                resp.release_conn()
-            except Exception:
-                pass
 
     filename = slug + os.path.splitext(key)[1]
     ct = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     return StreamingResponse(
-        _iter(),
+        store.stream(key),
         media_type=ct,
         headers={
             "Content-Disposition": f'attachment; filename="{filename}"',
@@ -494,18 +470,10 @@ def _source_file_key(slug: str, subkey: str) -> str:
 
 
 def _read_object_bytes(key: str) -> bytes:
-    client = Minio(MINIO_LIST_HOST, MINIO_ACCESS, MINIO_SECRET, secure=False, region=REGION)
     try:
-        resp = client.get_object(BUCKET, key)
-        return resp.read()
+        return store.get_bytes(key)
     except Exception:
         raise HTTPException(status_code=404, detail="object not found")
-    finally:
-        try:
-            resp.close()
-            resp.release_conn()
-        except Exception:
-            pass
 
 
 _EPUB_CACHE = {}
@@ -608,9 +576,8 @@ def api_raw(slug: str, subkey: str, request: Request):
         "epub": "application/epub+zip",
         "mobi": "application/x-mobipocket-ebook",
     }.get(ext, "application/octet-stream")
-    client = Minio(MINIO_LIST_HOST, MINIO_ACCESS, MINIO_SECRET, secure=False, region=REGION)
     try:
-        total = client.stat_object(BUCKET, key).size
+        total = store.stat(key)
     except Exception:
         raise HTTPException(status_code=404, detail="object not found")
     rng = request.headers.get("range")
@@ -629,15 +596,7 @@ def api_raw(slug: str, subkey: str, request: Request):
             if start > end or start >= total:
                 return Response(status_code=416, headers={"Content-Range": f"bytes */{total}"})
             length = end - start + 1
-            resp = client.get_object(BUCKET, key, offset=start, length=length)
-            try:
-                data = resp.read()
-            finally:
-                try:
-                    resp.close()
-                    resp.release_conn()
-                except Exception:
-                    pass
+            data = store.get_range(key, start, length)
             return Response(
                 content=data,
                 media_type=ct,
