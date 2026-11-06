@@ -1,0 +1,11 @@
+# Secrets / environment
+.env
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# VPS-specific ops scripts (contain internal paths / token references)
+run-tunnel.sh
+install.sh

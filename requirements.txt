@@ -1,0 +1,4 @@
+fastapi
+minio
+pyyaml
+uvicorn[standard]
