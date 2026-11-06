@@ -17,7 +17,7 @@ import yaml
 import markdown
 from minio import Minio
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse, HTMLResponse, Response, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, HTMLResponse, RedirectResponse, Response, FileResponse, StreamingResponse
 
 VAULT = os.environ.get("OBSIDIAN_VAULT_PATH", "/root/Documents/Obsidian Vault")
 KB_DIR = os.path.join(VAULT, "Knowledge base")
@@ -31,6 +31,14 @@ MINIO_SECRET = os.environ["MINIO_SECRET_KEY"]
 BUCKET = "knowledge-base"
 REGION = "us-east-1"
 PRESIGN_TTL = timedelta(hours=2)
+
+# Tigris (S3-compatible) presigning — active when AWS_ENDPOINT_URL_S3 is set.
+TIGRIS_ENDPOINT = os.environ.get("AWS_ENDPOINT_URL_S3", "")
+TIGRIS_ACCESS = os.environ.get("AWS_ACCESS_KEY_ID", "")
+TIGRIS_SECRET = os.environ.get("AWS_SECRET_ACCESS_KEY", "")
+TIGRIS_BUCKET = os.environ.get("BUCKET_NAME", BUCKET)
+VIDEO_PRESIGN_TTL = timedelta(hours=24)   # long talks must not 403 mid-playback
+FILE_PRESIGN_TTL = timedelta(hours=1)     # transcripts/slides are single fetches
 
 VIDEO_EXTS = (".mp4", ".webm", ".mkv", ".mov")
 MEDIA_PREFIXES = ("reels/", "videos/", "threads/")  # reels first = preferred on slug conflict (full-quality originals)
@@ -246,11 +254,34 @@ def catalog():
     return sorted(entries, key=lambda v: (bool(v["date"]), v["date"], v["slug"]), reverse=True)
 
 
-def presign(key: str) -> str:
+def presign(key: str, ttl: timedelta | None = None) -> str:
+    """Presign a GET URL for an object key.
+
+    Uses Tigris (boto3, S3-compatible) when AWS_ENDPOINT_URL_S3 is set;
+    otherwise falls back to the MinIO SDK. TTL defaults to PRESIGN_TTL.
+    """
+    ttl = ttl or PRESIGN_TTL
+    if TIGRIS_ENDPOINT:
+        import boto3
+        from botocore.config import Config
+
+        client = boto3.client(
+            "s3",
+            region_name="auto",
+            endpoint_url=TIGRIS_ENDPOINT,
+            aws_access_key_id=TIGRIS_ACCESS,
+            aws_secret_access_key=TIGRIS_SECRET,
+            config=Config(signature_version="s3v4", s3={"addressing_style": "virtual"}),
+        )
+        return client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": TIGRIS_BUCKET, "Key": key},
+            ExpiresIn=int(ttl.total_seconds()),
+        )
     # region set explicitly so the SDK skips the GetBucketLocation network
     # call (which would hit media.sevend.io through the Access gate → 403).
     client = Minio(MINIO_PUBLIC_HOST, MINIO_ACCESS, MINIO_SECRET, secure=True, region=REGION)
-    return client.presigned_get_object(BUCKET, key, expires=PRESIGN_TTL)
+    return client.presigned_get_object(BUCKET, key, expires=ttl)
 
 
 def _object_key_from_url(url: str):
@@ -320,8 +351,20 @@ def api_play(slug: str):
     vids = _videos_by_slug()
     if slug in vids:
         o = vids[slug]
-        return JSONResponse({"url": presign(o.object_name), "title": o.object_name})
+        return JSONResponse({"url": presign(o.object_name, VIDEO_PRESIGN_TTL), "title": o.object_name})
     raise HTTPException(status_code=404, detail="video not found")
+
+
+@app.get("/media/{key:path}")
+def media(key: str):
+    """302-redirect to a presigned URL for a raw object key.
+
+    Video gets a 24h TTL (long talks must not 403 mid-playback); everything
+    else (transcripts, slides, books) gets 1h.
+    """
+    ext = os.path.splitext(key)[1].lower()  # ".mp4"
+    ttl = VIDEO_PRESIGN_TTL if ext in VIDEO_EXTS else FILE_PRESIGN_TTL
+    return RedirectResponse(presign(key, ttl), status_code=302)
 
 
 @app.get("/api/download/{slug}")
@@ -427,11 +470,11 @@ def api_files(slug: str):
             urls = []
             for it in items:
                 key = _object_key_from_url(it)
-                urls.append(presign(key) if key else it)
+                urls.append(presign(key, FILE_PRESIGN_TTL) if key else it)
             out.append({"type": "slides", "label": "Slides", "urls": urls})
         elif isinstance(val, str):
             key = _object_key_from_url(val)
-            url = presign(key) if key else val
+            url = presign(key, FILE_PRESIGN_TTL) if key else val
             ext = os.path.splitext((key or val).split("?")[0].split("#")[0])[1].lower().lstrip(".")
             out.append({"type": subkey, "label": _file_label(subkey, val), "url": url, "ext": ext})
     return JSONResponse({"files": out})

@@ -1,4 +1,5 @@
 fastapi
 minio
 pyyaml
+boto3
 uvicorn[standard]
